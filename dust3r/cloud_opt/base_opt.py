@@ -16,13 +16,19 @@ import tqdm
 from dust3r.utils.geometry import inv, geotrf
 from dust3r.utils.device import to_numpy
 from dust3r.utils.image import rgb
-from dust3r.viz import SceneViz, segment_sky, auto_cam_size
+from dust3r.viz import SceneViz, segment_sky, auto_cam_size, CAM_COLORS, add_scene_cam, OPENGL
 from dust3r.optim_factory import adjust_learning_rate_by_lr
 
 from dust3r.cloud_opt.commons import (edge_str, ALL_DISTS, NoGradParamDict, get_imshapes, signed_expm1, signed_log1p,
                                       cosine_schedule, linear_schedule, get_conf_trf)
 import dust3r.cloud_opt.init_im_poses as init_fun
 
+# Test code
+import open3d as o3d
+import cv2
+import trimesh
+from scipy.spatial.transform import Rotation
+# from pytorch3d.renderer import look_at_view_transform, PointsRasterizer
 
 class BasePCOptimizer (nn.Module):
     """ Optimize a global scene, given a list of pairwise observations.
@@ -33,9 +39,9 @@ class BasePCOptimizer (nn.Module):
     def __init__(self, *args, **kwargs):
         if len(args) == 1 and len(kwargs) == 0:
             other = deepcopy(args[0])
-            attrs = '''edges is_symmetrized dist n_imgs pred_i pred_j imshapes 
+            attrs = '''edges is_symmetrized dist n_imgs pred_i pred_j imshapes
                         min_conf_thr conf_thr conf_i conf_j im_conf
-                        base_scale norm_pw_scale POSE_DIM pw_poses 
+                        base_scale norm_pw_scale POSE_DIM pw_poses
                         pw_adaptors pw_adaptors has_im_poses rand_pose imgs verbose'''.split()
             self.__dict__.update({k: other[k] for k in attrs})
         else:
@@ -231,7 +237,7 @@ class BasePCOptimizer (nn.Module):
 
     @torch.no_grad()
     def clean_pointcloud(self, tol=0.001, max_bad_conf=0):
-        """ Method: 
+        """ Method:
         1) express all 3d points in each camera coordinate frame
         2) if they're in front of a depthmap --> then lower their confidence
         """
@@ -343,8 +349,92 @@ class BasePCOptimizer (nn.Module):
                 pts = [geotrf(pw_poses[e], self.pred_i[edge_str(i, j)]) for e, (i, j) in enumerate(self.edges)]
                 viz.add_pointcloud(pts, (128, 0, 128))
 
+        """
+        # Test code, to generate an virtual image (not rendering, but just from pixels)
+        # 1. interpolate a virtual camera pose
+        test_camera_pose = im_poses[0] # the `1` camera is the reference camera
+        test_K = self.get_intrinsics()[0]
+        # 2. project the 3D points
+        pts = None
+        colors = None
+        for n in range(self.n_imgs):
+            pts3d = self.get_pts3d()[n]
+            mask = self.get_masks()[n]
+            color = self.imgs[n]
+            pts3d = to_numpy(pts3d)
+            mask = to_numpy(mask)
+            color = to_numpy(color)
+            if mask is None:
+                mask = [slice(None)] * len(pts3d)
+            pts_cur = np.concatenate([p[m] for p, m in zip(pts3d, mask)])
+            colors_cur = np.concatenate([c[m] for c, m in zip(color, mask)]) # [0,1]
+            pts = pts_cur if pts is None else np.concatenate([pts, pts_cur])
+            colors = colors_cur if colors is None else np.concatenate([colors, colors_cur])
+
+        # 3. fill the virtual image and save it
+        c2w = test_camera_pose
+        w2c = inv(c2w)
+        K = np.asarray(test_K.detach().cpu()); fx = K[0, 0]; fy = K[1, 1]; cx = K[0, 2]; cy = K[1, 2]
+        camera_points = w2c[:3,:3] @ pts.T + w2c[:3,3:4] #(3,N)
+
+        # project the 3d point cloud to the 2d image
+        pixel_x = (camera_points[0] * fx / camera_points[2] + cx).astype(int)
+        pixel_y = (camera_points[1] * fy / camera_points[2] + cy).astype(int)
+        # cat the pixel_x and pixel_y
+        pixel = np.stack([pixel_x, pixel_y], axis=1)
+        x_min = 0; x_max = cx * 2; y_min = 0; y_max = cy * 2
+        # remove the points that are out of the image and the corresponding colors
+        mask = (pixel[:,0] >= x_min) & (pixel[:,0] < x_max) & (pixel[:,1] >= y_min) & (pixel[:,1] < y_max)
+        pixel = pixel[mask]
+        colors = colors[mask]
+        # generate the image with the shape of (H, W, 3) -> (y_max, x_max, 3)
+        virtual_image = np.zeros((y_max.astype(int), x_max.astype(int), 3), dtype=np.float32)
+        virtual_image[pixel[:,1], pixel[:,0]] = colors
+        virtual_image = (virtual_image * 255.0).astype(np.uint8)
+        virtual_image = cv2.cvtColor(virtual_image, cv2.COLOR_RGB2BGR)
+        # save the virtual image
+        cv2.imwrite('virtual_image.png', virtual_image)
+        """
+
         viz.show(**kw)
         return viz
+
+    def show_modified(self, masking=True, cam_color=None, cam_size=0.03, transparent_cams=False, **kw):
+        rgbimg = self.imgs
+        focals = self.get_focals().cpu()
+        cams2world = self.get_im_poses().cpu()
+        # 3D pointcloud from depthmap, poses and intrinsics
+        self.min_conf_thr = float(self.conf_trf(torch.tensor(3))) # magic number
+        pts3d = to_numpy(self.get_pts3d())
+        msk = to_numpy(self.get_masks())
+        imgs = to_numpy(rgbimg)
+        focals = to_numpy(focals)
+        cams2world = to_numpy(cams2world)
+
+        scene = trimesh.Scene()
+
+        if masking:
+            # show point cloud, with msk
+            pts = np.concatenate([p[m] for p, m in zip(pts3d, msk)])
+            col = np.concatenate([p[m] for p, m in zip(imgs, msk)])
+            pct = trimesh.PointCloud(pts.reshape(-1, 3), colors=col.reshape(-1, 3))
+            scene.add_geometry(pct)
+
+        # add each camera
+        for i, pose_c2w in enumerate(cams2world):
+            if isinstance(cam_color, list):
+                camera_edge_color = cam_color[i]
+            else:
+                camera_edge_color = cam_color or CAM_COLORS[i % len(CAM_COLORS)]
+            add_scene_cam(scene, pose_c2w, camera_edge_color,
+                        None if transparent_cams else imgs[i], focals[i],
+                        imsize=imgs[i].shape[1::-1], screen_width=cam_size)
+
+        rot = np.eye(4)
+        rot[:3, :3] = Rotation.from_euler('y', np.deg2rad(180)).as_matrix()
+        scene.apply_transform(np.linalg.inv(cams2world[0] @ OPENGL @ rot))
+
+        scene.show(**kw)
 
 
 def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-6):
