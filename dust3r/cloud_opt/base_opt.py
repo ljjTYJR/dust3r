@@ -16,7 +16,7 @@ import tqdm
 from dust3r.utils.geometry import inv, geotrf
 from dust3r.utils.device import to_numpy
 from dust3r.utils.image import rgb
-from dust3r.viz import SceneViz, segment_sky, auto_cam_size, CAM_COLORS, add_scene_cam, OPENGL
+from dust3r.viz import SceneViz, segment_sky, auto_cam_size, CAM_COLORS, add_scene_cam, OPENGL, pts3d_to_trimesh, cat_meshes
 from dust3r.optim_factory import adjust_learning_rate_by_lr
 
 from dust3r.cloud_opt.commons import (edge_str, ALL_DISTS, NoGradParamDict, get_imshapes, signed_expm1, signed_log1p,
@@ -28,6 +28,7 @@ import open3d as o3d
 import cv2
 import trimesh
 from scipy.spatial.transform import Rotation
+import os
 # from pytorch3d.renderer import look_at_view_transform, PointsRasterizer
 
 class BasePCOptimizer (nn.Module):
@@ -399,7 +400,7 @@ class BasePCOptimizer (nn.Module):
         viz.show(**kw)
         return viz
 
-    def show_modified(self, masking=True, cam_color=None, cam_size=0.03, transparent_cams=False, **kw):
+    def show_modified(self, masking=True, cam_color=None, cam_size=0.03, as_pointcloud=False, transparent_cams=False, **kw):
         rgbimg = self.imgs
         focals = self.get_focals().cpu()
         cams2world = self.get_im_poses().cpu()
@@ -413,12 +414,19 @@ class BasePCOptimizer (nn.Module):
 
         scene = trimesh.Scene()
 
-        if masking:
+        if as_pointcloud:
             # show point cloud, with msk
             pts = np.concatenate([p[m] for p, m in zip(pts3d, msk)])
             col = np.concatenate([p[m] for p, m in zip(imgs, msk)])
             pct = trimesh.PointCloud(pts.reshape(-1, 3), colors=col.reshape(-1, 3))
             scene.add_geometry(pct)
+        else:
+            meshes = []
+            for i in range(len(imgs)):
+                meshes.append(pts3d_to_trimesh(imgs[i], pts3d[i], msk[i]))
+            mesh = trimesh.Trimesh(**cat_meshes(meshes))
+            scene.add_geometry(mesh)
+
 
         # add each camera
         for i, pose_c2w in enumerate(cams2world):
@@ -434,7 +442,14 @@ class BasePCOptimizer (nn.Module):
         rot[:3, :3] = Rotation.from_euler('y', np.deg2rad(180)).as_matrix()
         scene.apply_transform(np.linalg.inv(cams2world[0] @ OPENGL @ rot))
 
-        scene.show(**kw)
+        # save the result
+        outdir = 'output'
+        outfile = os.path.join(outdir, 'scene.glb')
+        os.makedirs(outdir, exist_ok=True)
+        scene.export(file_obj=outfile)
+        print(f"Scene exported to {outfile}")
+
+        # scene.show(**kw)
 
 
 def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-6):
